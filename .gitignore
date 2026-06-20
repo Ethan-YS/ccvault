@@ -1,0 +1,25 @@
+# ---- User data / privacy — NEVER commit conversations ----
+截图/
+screenshots-private/
+.ccvault/
+archive/
+*-archive/
+**/对话存档/
+*.jsonl
+*.zip
+config.json
+port
+.manifest.json
+
+# ---- Python ----
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# ---- OS / editor ----
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
