@@ -1,5 +1,7 @@
 # 📦 ccvault — Claude Code Vault
 
+**English** · [中文](README.zh.md)
+
 Back up, browse, search, and export your [Claude Code](https://claude.com/claude-code) conversations — **100% local, zero dependencies, no network**.
 
 ![ccvault — browse, search and export your Claude Code conversations](docs/screenshot-en.png)
@@ -26,7 +28,7 @@ Claude Code stores your chats as `.jsonl` transcripts under `~/.claude/projects`
 ## Quick start
 
 ```bash
-git clone <repo-url>
+git clone https://github.com/Ethan-YS/ccvault.git
 cd ccvault
 python3 ccvault.py
 ```
