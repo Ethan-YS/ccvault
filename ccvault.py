@@ -16,6 +16,7 @@ Usage:
     python3 ccvault.py --port 8765
     python3 ccvault.py --copy-raw       # also copy original .jsonl into the archive
     python3 ccvault.py --update-only    # just (re)build the archive, no server
+    python3 ccvault.py --no-window-names  # don't use window names from the Claude desktop app as titles
 
 MIT License.
 """
@@ -27,6 +28,8 @@ CONFIG_DIR = os.path.join(HOME, ".ccvault")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
 DEFAULT_SRC = os.path.join(HOME, ".claude", "projects")
 DEFAULT_OUT = os.path.join(CONFIG_DIR, "archive")
+DEFAULT_SESSIONS = os.path.join(HOME, ".claude", "sessions")   # per-open-window files of the Claude desktop app
+NAMES_PATH = os.path.join(CONFIG_DIR, "session-names.json")   # sessionId -> window name, kept after the window closes
 
 TOOL_RESULT_MAXLEN = 8000
 TOOL_INPUT_MAXLEN = 4000
@@ -126,6 +129,99 @@ def tool_result_text(block):
     return json.dumps(content, ensure_ascii=False)
 
 
+# ---------------------------------------------------------------- window names
+
+def sessions_dir_for(src):
+    """The Claude desktop app keeps one small JSON per *open* window (``~/.claude/sessions/<pid>.json``)
+    with the session id and the name you gave that window. With a custom ``--src`` we first look for a
+    sibling ``sessions/`` folder, then fall back to the default location."""
+    cand = os.path.join(os.path.dirname(os.path.abspath(src or DEFAULT_SRC)), "sessions")
+    return cand if os.path.isdir(cand) else DEFAULT_SESSIONS
+
+
+def load_names():
+    try:
+        d = json.load(open(NAMES_PATH, encoding="utf-8"))
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def collect_session_names(src):
+    """Copy ``sessionId -> window name`` into ``~/.ccvault/session-names.json`` (incremental merge).
+    Those per-window files disappear the moment a window is closed, so every look is a chance to
+    remember a name before it is gone; earlier names of the same session are kept under ``history``.
+    Only ``*.json`` files are read (the ``.key`` files beside them are never touched) and only the
+    session id, the name and the working directory are kept. Returns ``{sessionId: name}``."""
+    names = load_names()
+    sdir = sessions_dir_for(src)
+    changed = False
+    try:
+        files = [f for f in os.listdir(sdir) if f.endswith(".json")]
+    except Exception:
+        files = []
+    now = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+    for f in files:
+        try:
+            o = json.load(open(os.path.join(sdir, f), encoding="utf-8"))
+        except Exception:
+            continue
+        if not isinstance(o, dict):
+            continue
+        sid = str(o.get("sessionId") or "").strip()
+        name = str(o.get("name") or "").strip()
+        if not sid or not name:
+            continue
+        cwd = str(o.get("cwd") or "")
+        rec = names.get(sid) if isinstance(names.get(sid), dict) else None
+        if rec is None:
+            rec = {"name": name, "cwd": cwd, "recorded": now, "history": []}
+            for old in (o.get("formerNames") or []):
+                if isinstance(old, str) and old and old != name and old not in rec["history"]:
+                    rec["history"].append(old)
+            names[sid] = rec
+            changed = True
+            continue
+        if rec.get("name") != name:
+            if rec.get("name") and rec["name"] not in rec.setdefault("history", []):
+                rec["history"].append(rec["name"])
+            rec["name"] = name
+            rec["recorded"] = now
+            changed = True
+        if cwd and rec.get("cwd") != cwd:
+            rec["cwd"] = cwd
+            changed = True
+    if changed:
+        try:
+            os.makedirs(CONFIG_DIR, exist_ok=True)
+            tmp = NAMES_PATH + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(names, fh, ensure_ascii=False, indent=2)
+            os.replace(tmp, NAMES_PATH)
+        except Exception:
+            pass
+    return {sid: r.get("name", "") for sid, r in names.items() if isinstance(r, dict) and r.get("name")}
+
+
+def current_names():
+    """Window names to use right now (empty when the feature is off)."""
+    if not STATE.get("window_names", True):
+        return {}
+    return collect_session_names(STATE["src"])
+
+
+def apply_window_name(payload, sid, names):
+    """Prefer the window name as the title; keep the first message as ``firstLine``."""
+    nm = names.get(sid) or payload.get("windowName") or ""
+    if not nm:
+        return payload
+    if not payload.get("firstLine"):
+        payload["firstLine"] = payload.get("title") or ""
+    payload["windowName"] = nm
+    payload["title"] = nm
+    return payload
+
+
 # ---------------------------------------------------------------- parsing
 
 def parse_session(path):
@@ -179,9 +275,10 @@ def first_user_text(rows):
     return ""
 
 
-def build_payload(meta, rows, encoded):
+def build_payload(meta, rows, encoded, window_name=""):
     """Structured, name-free representation. Roles only (user/assistant);
-    the UI decides how to label them."""
+    the UI decides how to label them. ``window_name`` (from the desktop app, optional)
+    becomes the title; the first user message is kept as ``firstLine``."""
     msgs = []
     for t, o in rows:
         m = o.get("message") or {}
@@ -235,8 +332,11 @@ def build_payload(meta, rows, encoded):
             if blocks:
                 msgs.append({"role": "assistant", "time": ts, "blocks": blocks})
     ftext = first_user_text(rows).replace("\n", " ").strip()
+    first_line = ftext[:60] or meta.get("aiTitle") or "(untitled)"
     return {
-        "title": (ftext[:60] or meta.get("aiTitle") or "(untitled)"),
+        "title": (window_name or first_line),
+        "windowName": window_name or "",
+        "firstLine": first_line,
         "aiTitle": meta.get("aiTitle") or "",
         "project": friendly_project(meta.get("cwd"), encoded),
         "model": nice_model(meta.get("model")),
@@ -328,8 +428,10 @@ def fingerprint(info):
     return hashlib.md5(base.encode("utf-8")).hexdigest()[:12]
 
 
-def build_archive(src, out, copy_raw=False, force=False, dedupe=True):
+def build_archive(src, out, copy_raw=False, force=False, dedupe=True, names=None):
     os.makedirs(out, exist_ok=True)
+    if names is None:
+        names = collect_session_names(src) if STATE.get("window_names", True) else {}
     manifest_path = os.path.join(out, ".manifest.json")
     manifest = {}
     if os.path.exists(manifest_path) and not force:
@@ -394,7 +496,7 @@ def build_archive(src, out, copy_raw=False, force=False, dedupe=True):
             continue
         try:
             meta, rows = parse_session(it["path"])
-            payload = build_payload(meta, rows, "")
+            payload = build_payload(meta, rows, "", names.get(it["stem"], ""))
             md = payload_to_md(payload, False, {"user": "User", "ai": "Claude"})
         except Exception:
             stats["failed"] += 1
@@ -418,7 +520,8 @@ def build_archive(src, out, copy_raw=False, force=False, dedupe=True):
                 pass
         manifest[key] = {"stem": it["stem"], "mtime": st.st_mtime, "size": st.st_size,
                          "mdfile": os.path.relpath(md_path, out), "jsonfile": os.path.relpath(json_path, out),
-                         "title": payload["title"], "proj": it["proj"], "date": d,
+                         "title": payload["title"], "first": payload["firstLine"], "wname": payload["windowName"],
+                         "proj": it["proj"], "date": d,
                          "msgcount": payload["msgcount"], "model": payload["model"]}
         stats["converted"] += 1
 
@@ -437,7 +540,7 @@ def build_archive(src, out, copy_raw=False, force=False, dedupe=True):
 
 # ---------------------------------------------------------------- web app
 
-STATE = {"src": DEFAULT_SRC, "out": DEFAULT_OUT, "copy_raw": False, "dedupe": True}
+STATE = {"src": DEFAULT_SRC, "out": DEFAULT_OUT, "copy_raw": False, "dedupe": True, "window_names": True}
 
 
 def load_manifest():
@@ -449,10 +552,14 @@ def load_manifest():
 
 def list_payload():
     man = load_manifest()
+    names = current_names()
+    use_names = STATE.get("window_names", True)
     groups = {}
     for stem, v in man.items():
+        first = v.get("first") or v.get("title", "(untitled)")
+        wname = (names.get(v.get("stem") or "") or v.get("wname") or "") if use_names else ""
         groups.setdefault(v.get("proj", "?"), []).append({
-            "stem": stem, "title": v.get("title", "(untitled)"),
+            "stem": stem, "title": wname or first, "first": first if wname else "", "wname": wname,
             "date": v.get("date", "0000-00-00"), "msgcount": v.get("msgcount", 0)})
     out = []
     for proj, sess in groups.items():
@@ -472,9 +579,15 @@ def get_session(stem):
     if not os.path.exists(jp):
         return None
     try:
-        return json.load(open(jp, encoding="utf-8"))
+        payload = json.load(open(jp, encoding="utf-8"))
     except Exception:
         return None
+    if STATE.get("window_names", True):
+        apply_window_name(payload, rec.get("stem") or "", current_names())
+    elif payload.get("windowName"):
+        payload["windowName"] = ""
+        payload["title"] = payload.get("firstLine") or payload.get("title")
+    return payload
 
 
 PAGE = r"""<!DOCTYPE html>
@@ -661,7 +774,7 @@ async function loadList(){
 }
 function itemEl(s,projLabel,isArc){
   let it=document.createElement('div'); it.className='item'+(s.stem===curStem?' active':'');
-  let sub=isArc?(esc(projLabel)+' · '+s.date):(s.date+(s.msgcount?(' · '+s.msgcount):''));
+  let sub=(isArc?(esc(projLabel)+' · '+s.date):(s.date+(s.msgcount?(' · '+s.msgcount):'')))+(s.first?(' · '+esc(s.first)):'');
   it.innerHTML='<div class="icontent"><div class="t">'+esc(s.title)+'</div><div class="d">'+sub+'</div></div><button class="arc" title="'+(isArc?t('restore'):t('archiveHide'))+'">'+(isArc?'↩':'📥')+'</button>';
   it.querySelector('.icontent').onclick=()=>loadSession(s.stem);
   it.querySelector('.arc').onclick=(e)=>{e.stopPropagation(); isArc?archived.delete(s.stem):archived.add(s.stem); saveArchived(); renderList(document.getElementById('q').value.trim());};
@@ -672,7 +785,7 @@ function renderList(q){
   document.getElementById('arcCount').textContent=archived.size;
   if(archiveView){
     let arr=[];
-    for(const g of LIST.projects) for(const s of g.sessions) if(archived.has(s.stem)&&(!q||s.title.toLowerCase().includes(q)||g.project.toLowerCase().includes(q))) arr.push([s,g.project]);
+    for(const g of LIST.projects) for(const s of g.sessions) if(archived.has(s.stem)&&(!q||(s.title+' '+(s.first||'')).toLowerCase().includes(q)||g.project.toLowerCase().includes(q))) arr.push([s,g.project]);
     if(!arr.length){host.innerHTML='<div class="proj">'+t('noArchived')+'</div>'; return;}
     arr.sort((a,b)=>b[0].date.localeCompare(a[0].date));
     for(const [s,pj] of arr) host.appendChild(itemEl(s,pj,true)); return;
@@ -680,7 +793,7 @@ function renderList(q){
   let any=false;
   for(const g of LIST.projects){
     if(hiddenProjects.has(g.project)) continue;
-    let sess=g.sessions.filter(s=>!archived.has(s.stem)&&(!q||s.title.toLowerCase().includes(q)||g.project.toLowerCase().includes(q)));
+    let sess=g.sessions.filter(s=>!archived.has(s.stem)&&(!q||(s.title+' '+(s.first||'')).toLowerCase().includes(q)||g.project.toLowerCase().includes(q)));
     if(!sess.length) continue; any=true;
     let isOpen=!!q||expanded.has(g.project);
     let f=document.createElement('div'); f.className='folder'+(isOpen?' open':'');
@@ -705,6 +818,7 @@ function renderSession(s){
   let meta=[s.project]; if(s.model)meta.push(s.model); if(s.time)meta.push(s.time); meta.push(s.msgcount+' '+t('msgs'));
   p.push('<div class="smeta">'+esc(meta.join(' · '))+'</div>');
   if(s.aiTitle) p.push('<div class="smeta">🏷️ '+esc(s.aiTitle)+'</div>');
+  if(s.windowName&&s.firstLine&&s.firstLine!==s.title) p.push('<div class="smeta">💬 '+esc(s.firstLine)+'</div>');
   p.push('<div class="snote">📂 '+esc(s.cwd||'')+'　·　'+t('thinkingNote')+'</div>');
   p.push('<div class="vtools"><button class="vbtn'+(cleanView?' on':'')+'" onclick="toggleClean()">'+(cleanView?t('showAll'):t('chatOnly'))+'</button><button class="vbtn" onclick="exportCur()">'+t('exportMd')+'</button></div>');
   for(const m of s.messages){
@@ -743,7 +857,7 @@ async function bulkExport(stems){
   try{ let r=await fetch('/api/export',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({stems,clean:cleanView})}); let blob=await r.blob(); dl(blob,'ccvault-export'+(cleanView?'_chatonly':'')+'.zip'); toast('✅ '+t('exported')+' '+stems.length); }
   catch(e){ toast('⚠️ '+t('exportFail')+': '+e); }
 }
-function visibleStems(){ let q=document.getElementById('q').value.trim().toLowerCase(),st=[]; for(const g of LIST.projects){ if(hiddenProjects.has(g.project))continue; for(const s of g.sessions){ if(archived.has(s.stem))continue; if(q&&!(s.title.toLowerCase().includes(q)||g.project.toLowerCase().includes(q)))continue; st.push(s.stem); } } return st; }
+function visibleStems(){ let q=document.getElementById('q').value.trim().toLowerCase(),st=[]; for(const g of LIST.projects){ if(hiddenProjects.has(g.project))continue; for(const s of g.sessions){ if(archived.has(s.stem))continue; if(q&&!((s.title+' '+(s.first||'')).toLowerCase().includes(q)||g.project.toLowerCase().includes(q)))continue; st.push(s.stem); } } return st; }
 function exportVisible(){ bulkExport(visibleStems()); }
 function exportProject(proj){ let g=LIST.projects.find(x=>x.project===proj); if(!g)return; bulkExport(g.sessions.filter(s=>!archived.has(s.stem)).map(s=>s.stem)); }
 function toggleArchiveView(){ archiveView=!archiveView; document.getElementById('btnArchive').classList.toggle('on',archiveView); document.getElementById('filterPanel').hidden=true; document.getElementById('btnFilter').classList.remove('on'); renderList(document.getElementById('q').value.trim()); }
@@ -853,6 +967,7 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 req = self._read_json(); stems = req.get("stems", []); clean = bool(req.get("clean"))
                 man = load_manifest(); buf = io.BytesIO()
+                names = current_names()
                 with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
                     for stem in stems:
                         rec = man.get(stem)
@@ -865,6 +980,8 @@ class Handler(BaseHTTPRequestHandler):
                             payload = json.load(open(jp, encoding="utf-8"))
                         except Exception:
                             continue
+                        if STATE.get("window_names", True):
+                            apply_window_name(payload, rec.get("stem") or "", names)
                         md = payload_to_md(payload, clean, {"user": "You", "ai": "Claude"})
                         base = sanitize(rec.get("date", "") + "_" + (payload.get("title") or "chat"))[:60]
                         z.writestr(base + "_" + stem[:6] + ".md", md)
@@ -894,7 +1011,9 @@ def main():
     ap.add_argument("--update-only", action="store_true", help="rebuild the archive and exit (no server)")
     ap.add_argument("--no-dedupe", dest="dedupe", action="store_false", help="keep every snapshot (don't merge resume duplicates of the same conversation)")
     ap.add_argument("--no-open", action="store_true")
-    ap.set_defaults(dedupe=True)
+    ap.add_argument("--no-window-names", dest="window_names", action="store_false",
+                    help="don't read window names from the Claude desktop app (~/.claude/sessions); titles are always the first message")
+    ap.set_defaults(dedupe=True, window_names=True)
     args = ap.parse_args()
 
     cfg = load_config()
@@ -902,6 +1021,7 @@ def main():
     STATE["out"] = args.out or cfg.get("out") or DEFAULT_OUT
     STATE["copy_raw"] = args.copy_raw or cfg.get("copy_raw", False)
     STATE["dedupe"] = args.dedupe
+    STATE["window_names"] = bool(args.window_names and cfg.get("window_names", True))
 
     if not os.path.isdir(STATE["src"]):
         print(f"⚠️  Claude Code folder not found: {STATE['src']}")

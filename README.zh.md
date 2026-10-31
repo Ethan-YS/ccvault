@@ -22,6 +22,7 @@ Claude Code 把你的对话以 `.jsonl` 文件存在 `~/.claude/projects` 下。
 - ⬇ **导出** —— 单条对话、整个项目、或当前所见的全部 —— 导出成 Markdown / zip
 - 🔄 **增量更新** —— 只重新处理新增或有改动的对话
 - ♊ **自动去重** —— Claude Code 每次续聊都会存一份新快照;ccvault 只保留最完整的那份,同一对话不会重复出现(`--no-dedupe` 可保留全部)
+- 🪟 **窗口名** —— 在 Claude 桌面应用里给窗口起过名?ccvault 会把这些名字读过来,优先用作侧边栏和导出的标题(没有名字的仍用第一句话)。名字存在 `~/.ccvault/session-names.json`,窗口关掉以后也还在
 - 🔒 **隐私优先** —— 完全运行在 `127.0.0.1`,从不联网,从不改动你的原始对话文件
 
 ## 环境要求
@@ -52,6 +53,7 @@ python3 ccvault.py --port 8765
 python3 ccvault.py --copy-raw      # 同时把原始 .jsonl 一并复制进存档
 python3 ccvault.py --no-dedupe     # 保留每一份快照(不合并续聊产生的重复)
 python3 ccvault.py --update-only   # 重建存档后退出(不启动服务器)
+python3 ccvault.py --no-window-names  # 不读 Claude 桌面应用的窗口名,标题一律用第一句话
 ```
 
 你也可以在网页界面里(**⚙︎ Source**)把 ccvault 指向另一个对话文件夹 —— 如果你的 `.claude` 在非标准位置,或你想浏览一份备份,这会很有用。
@@ -64,6 +66,7 @@ python3 ccvault.py --update-only   # 重建存档后退出(不启动服务器)
 
 ## 说明
 
+- **窗口名**来自 Claude 桌面应用在 `~/.claude/sessions` 下为每个**开着的**窗口留的一个小文件。ccvault 只读不写,只留 session id、名字和工作目录三样。窗口一关这个文件就没了,所以 ccvault 每次运行都会把当时能看到的名字抄一遍 —— 让它(或定时的 `--update-only`)在窗口开着的时候跑一下就行。从来没有在 ccvault 运行时开着的会话,标题仍是第一句话。
 - Claude Code **不会**把模型的*思考*文本存进对话文件(只存一段加密签名),所以思考过程无法显示或导出。这是源数据本身的限制,不是 ccvault 的问题。
 
 ## 许可

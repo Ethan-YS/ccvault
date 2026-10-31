@@ -22,6 +22,7 @@ Claude Code stores your chats as `.jsonl` transcripts under `~/.claude/projects`
 - ⬇ **Export** a single chat, a whole project, or everything you currently see — as Markdown / a zip
 - 🔄 **Incremental update** — only new or changed chats get reprocessed
 - ♊ **Auto-dedupe** — Claude Code saves a fresh snapshot every time you resume a chat; ccvault keeps only the most complete one, so the same conversation never shows up twice (`--no-dedupe` keeps them all)
+- 🪟 **Window names** — named your sessions in the Claude desktop app? ccvault picks those names up and uses them as titles in the sidebar and in exports (falling back to the first message). Names are remembered in `~/.ccvault/session-names.json`, so they survive after the window is closed
 - 🔒 **Private by design** — runs entirely on `127.0.0.1`, never touches the network, never modifies your original transcripts
 
 ## Requirements
@@ -52,6 +53,7 @@ python3 ccvault.py --port 8765
 python3 ccvault.py --copy-raw      # also copy the original .jsonl into the archive
 python3 ccvault.py --no-dedupe     # keep every snapshot (don't merge resume duplicates)
 python3 ccvault.py --update-only   # rebuild the archive and exit (no server)
+python3 ccvault.py --no-window-names  # ignore window names from the Claude desktop app
 ```
 
 You can also point ccvault at a different transcripts folder from the web UI (**⚙︎ Source**) — useful if your `.claude` lives somewhere non-standard, or to browse a backup.
@@ -64,6 +66,7 @@ You can also point ccvault at a different transcripts folder from the web UI (**
 
 ## Notes
 
+- **Window names** come from the small per-session files the Claude desktop app keeps under `~/.claude/sessions` only while a window is open. ccvault reads them (never writes them) and keeps just the session id, the name and the working directory. Because a file vanishes as soon as its window is closed, ccvault copies the names over every time it looks — so run it (or let a scheduled `--update-only` run) while your windows are open. A session that was never open while ccvault ran keeps its first message as the title.
 - Claude Code does **not** store the model's *thinking* text in transcripts (only an encrypted signature), so thinking can't be shown or exported. This is a limitation of the source data, not ccvault.
 
 ## License
